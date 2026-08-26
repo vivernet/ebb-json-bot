@@ -1,0 +1,38 @@
+{
+  "name": "ebb-json-bot",
+  "version": "1.0.0",
+  "description": "Telegram-бот, который показывает входящие обновления в виде JSON.",
+  "keywords": [
+    "telegram",
+    "telegram-bot",
+    "grammy",
+    "json",
+    "updates",
+    "esm"
+  ],
+  "homepage": "https://github.com/vivernet/ebb-json-bot#readme",
+  "bugs": {
+    "url": "https://github.com/vivernet/ebb-json-bot/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vivernet/ebb-json-bot.git"
+  },
+  "author": {
+    "name": "Aleksandr Kliushenok",
+    "url": "https://github.com/vivernet"
+  },
+  "license": "UNLICENSED",
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file=.env src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/bot.js && node --check src/polling.js && node --check src/update-json.js && node --check src/update-target.js && node --check src/update-types.js"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "dependencies": {
+    "grammy": "^1.45.1"
+  }
+}

@@ -1,0 +1,39 @@
+/** @file Перечисляет все типы обновлений актуального Telegram Bot API. */
+
+/**
+ * Полный список полей объекта Update в Telegram Bot API 10.3.
+ *
+ * Пустой `allowed_updates` не подходит: Telegram исключает из него
+ * `chat_member`, `message_reaction` и `message_reaction_count`.
+ *
+ * @type {readonly string[]}
+ */
+export const ALL_UPDATE_TYPES = Object.freeze([
+  'message',
+  'edited_message',
+  'channel_post',
+  'edited_channel_post',
+  'business_connection',
+  'business_message',
+  'edited_business_message',
+  'deleted_business_messages',
+  'guest_message',
+  'message_reaction',
+  'message_reaction_count',
+  'inline_query',
+  'chosen_inline_result',
+  'callback_query',
+  'shipping_query',
+  'pre_checkout_query',
+  'purchased_paid_media',
+  'poll',
+  'poll_answer',
+  'my_chat_member',
+  'chat_member',
+  'chat_join_request',
+  'chat_boost',
+  'removed_chat_boost',
+  'managed_bot',
+  'subscription',
+  'stopped_message_generation',
+]);
