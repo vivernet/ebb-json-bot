@@ -43,7 +43,6 @@ const MESSAGE_CONTAINERS = Object.freeze([
   ['business_message'],
   ['edited_business_message'],
   ['guest_message'],
-  ['callback_query', 'message'],
 ]);
 
 /**
@@ -76,6 +75,9 @@ function isChatId(value) {
  * @property {number | string} chatId Идентификатор чата для `sendMessage`.
  * @property {number | undefined} messageThreadId Тема форума, если она известна.
  * @property {number | undefined} [directMessagesTopicId] Тема direct messages канала.
+ * @property {string} [businessConnectionId] Подключение бизнес-аккаунта, от имени которого отправляется ответ.
+ * @property {{receiver_user_id: number, callback_query_id?: string}} [ephemeralMessageParameters] Параметры ответа, видимого только инициатору приватного события.
+ * @property {{ephemeral_message_id: number}} [replyParameters] Привязка ответа к входящей приватной команде.
  */
 
 /**
@@ -96,6 +98,7 @@ function getChatTarget(container) {
   }
 
   const directMessagesTopicId = container.direct_messages_topic?.topic_id;
+  const businessConnectionId = container.business_connection_id;
 
   return {
     chatId,
@@ -105,6 +108,63 @@ function getChatTarget(container) {
     ...(Number.isSafeInteger(directMessagesTopicId)
       ? { directMessagesTopicId }
       : {}),
+    ...(typeof businessConnectionId === 'string' && businessConnectionId.length > 0
+      ? { businessConnectionId }
+      : {}),
+  };
+}
+
+/**
+ * Проверяет признаки приватного сообщения внутри группового чата.
+ * Одного `message_id: 0` недостаточно: такой идентификатор бывает и у отложенной отправки.
+ *
+ * @param {unknown} container Возможный объект Message.
+ * @returns {boolean} `true`, если событие нельзя публиковать для всего чата.
+ */
+function isEphemeralMessage(container) {
+  return Boolean(container && typeof container === 'object'
+    && ('ephemeral_message_id' in container || 'receiver_user' in container));
+}
+
+/**
+ * Сохраняет приватность команды или нажатия кнопки ephemeral-сообщения.
+ * Получателем ответа становится инициатор события, а не получатель исходного сообщения.
+ * При неполных данных запрещает отправку, чтобы JSON не появился в общем чате.
+ *
+ * @param {object} message Исходное приватное сообщение.
+ * @param {ChatTarget | undefined} target Основной адресат сообщения.
+ * @param {object | undefined} callbackQuery Запрос нажатия кнопки, если он есть.
+ * @returns {ChatTarget | undefined} Приватный адресат либо `undefined`.
+ */
+function getEphemeralTarget(message, target, callbackQuery) {
+  const actor = callbackQuery ? callbackQuery.from : message.from;
+
+  if (!target || !Number.isSafeInteger(actor?.id) || actor.id <= 0 || actor.is_bot === true) {
+    return undefined;
+  }
+
+  if (callbackQuery) {
+    if (typeof callbackQuery.id !== 'string' || callbackQuery.id.length === 0) {
+      return undefined;
+    }
+
+    return {
+      ...target,
+      ephemeralMessageParameters: {
+        receiver_user_id: actor.id,
+        callback_query_id: callbackQuery.id,
+      },
+    };
+  }
+
+  if (!Number.isSafeInteger(message.ephemeral_message_id)) {
+    return undefined;
+  }
+
+  return {
+    ...target,
+    ephemeralMessageParameters: { receiver_user_id: actor.id },
+    replyParameters: { ephemeral_message_id: message.ephemeral_message_id },
   };
 }
 
@@ -140,13 +200,26 @@ function getUserTarget(user) {
  * Находит чат, из которого пришло обновление. Если Telegram не передаёт
  * чат, но передаёт инициатора события, возвращает личный чат этого пользователя.
  * Для business_connection используется документированный `user_chat_id`.
+ * У бизнес-сообщений сохраняет подключение: чат бизнес-аккаунта отличается
+ * от обычного чата бота с тем же идентификатором.
+ * Приватные команды и кнопки ephemeral-сообщений остаются видимыми только
+ * инициатору; неполные приватные события не допускают публичного или личного fallback.
  *
  * @param {object} update Сырое входящее обновление Telegram.
  * @returns {ChatTarget | undefined} Адресат либо `undefined`, если Bot API не передаёт чат.
  */
 export function getUpdateTarget(update) {
   for (const path of CHAT_CONTAINERS) {
-    const target = getChatTarget(getAtPath(update, path));
+    const container = getAtPath(update, path);
+    const target = getChatTarget(container);
+
+    if (isEphemeralMessage(container)) {
+      return getEphemeralTarget(
+        container,
+        target,
+        path[0] === 'callback_query' ? update.callback_query : undefined,
+      );
+    }
 
     if (target) {
       return target;
@@ -204,6 +277,9 @@ export function getUpdateType(update) {
  * Проверяет, не является ли обновление сообщением, которое бот создал сам.
  * Это исключает самоповторение JSON, если Telegram доставляет исходящие
  * сообщения бота обратно как Update.
+ * У бизнес-сообщений фактический бот-отправитель указан в `sender_business_bot`.
+ * Сообщение внутри `callback_query` не проверяется: событие создаёт пользователь,
+ * нажавший кнопку, даже если сама кнопка находится в сообщении текущего бота.
  *
  * @param {object} update Сырое входящее обновление Telegram.
  * @param {number} botId Идентификатор текущего бота.
@@ -212,6 +288,7 @@ export function getUpdateType(update) {
 export function isOwnMessageUpdate(update, botId) {
   return MESSAGE_CONTAINERS.some((path) => {
     const message = getAtPath(update, path);
-    return message && typeof message === 'object' && message.from?.id === botId;
+    return Boolean(message && typeof message === 'object'
+      && (message.from?.id === botId || message.sender_business_bot?.id === botId));
   });
 }

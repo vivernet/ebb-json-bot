@@ -42,6 +42,47 @@ test('делит большой JSON без разрыва суррогатны�
   assert.ok(parts.every((part) => part.length <= TELEGRAM_MESSAGE_TEXT_LIMIT));
 });
 
+/** Проверяет отсутствие пустого остатка на точной границе Telegram. */
+test('сохраняет полные части при длине, кратной лимиту', () => {
+  const fullPart = 'a'.repeat(TELEGRAM_MESSAGE_TEXT_LIMIT);
+
+  assert.deepEqual(splitText(fullPart), [fullPart]);
+  assert.deepEqual(splitText(fullPart.repeat(2)), [fullPart, fullPart]);
+});
+
+/** Проверяет заполнение минимальной части целой суррогатной парой. */
+test('делит emoji при минимальном допустимом лимите', () => {
+  assert.deepEqual(splitText('😀💡a😀', 2), ['😀', '💡', 'a', '😀']);
+});
+
+/** Проверяет сохранность JSON с HTML и буквальными сущностями после разбиения. */
+test('восстанавливает JSON из экранированных частей без повторного декодирования', () => {
+  const json = serializeUpdate({
+    update_id: 42,
+    message: { text: '<b>😀</b>&lt;&#128512;'.repeat(300) },
+  });
+  const parts = splitText(json);
+  const decodedParts = parts.map((part) => {
+    const html = wrapJsonAsPre(part);
+    const prefix = '<pre><code class="language-json">';
+    const suffix = '</code></pre>';
+
+    assert.ok(html.startsWith(prefix));
+    assert.ok(html.endsWith(suffix));
+
+    const encodedText = html.slice(prefix.length, -suffix.length);
+    assert.doesNotMatch(encodedText, /[<>]/u);
+
+    const characters = { '&amp;': '&', '&lt;': '<', '&gt;': '>' };
+    return encodedText.replace(/&(?:amp|lt|gt);/gu, (entity) => characters[entity]);
+  });
+
+  assert.ok(parts.length > 1);
+  assert.deepEqual(decodedParts, parts);
+  assert.equal(decodedParts.join(''), json);
+  assert.ok(decodedParts.every((part) => part.length <= TELEGRAM_MESSAGE_TEXT_LIMIT));
+});
+
 /** Проверяет пустую строку и недопустимый лимит. */
 test('не создаёт пустых частей и проверяет лимит', () => {
   assert.deepEqual(splitText(''), []);

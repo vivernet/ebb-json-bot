@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GrammyError } from 'grammy';
+import { GrammyError, HttpError } from 'grammy';
 
 import { createBot, isExpectedDeliveryError } from '../src/bot.js';
 
@@ -45,7 +45,7 @@ function captureApiCalls(bot) {
   async function transformer(previous, method, payload) {
     calls.push({ method, payload });
 
-    if (method === 'deleteMessage') {
+    if (method === 'deleteMessage' || method === 'answerCallbackQuery') {
       return { ok: true, result: true };
     }
 
@@ -83,7 +83,14 @@ function createGrammyError(errorCode, description, method = 'sendMessage') {
   );
 }
 
-/** Создаёт минимальное входящее обновление Telegram с сообщением. */
+/**
+ * Создаёт минимальное входящее обновление Telegram с сообщением.
+ *
+ * @param {string} chatType Тип чата в фикстуре.
+ * @param {number} chatId Идентификатор чата.
+ * @param {object} [messageOverrides] Поля, переопределяемые для сценария.
+ * @returns {object} Обновление с сообщением.
+ */
 function createMessageUpdate(chatType, chatId, messageOverrides = {}) {
   return {
     update_id: 1,
@@ -338,4 +345,223 @@ test('молча обрабатывает блокировку бота поль
   }
 
   assert.deepEqual(consoleErrors, []);
+});
+
+test('подтверждает кнопку на собственном сообщении и отправляет JSON', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  const update = {
+    update_id: 50,
+    callback_query: {
+      id: 'button-query',
+      from: { id: 100, is_bot: false, first_name: 'Тест' },
+      chat_instance: 'instance',
+      data: 'example',
+      message: createMessageUpdate('private', 100, {
+        from: bot.botInfo,
+      }).message,
+    },
+  };
+
+  await bot.handleUpdate(update);
+
+  assert.deepEqual(calls.map(({ method }) => method), ['answerCallbackQuery', 'sendMessage']);
+  assert.equal(calls[0].payload.callback_query_id, 'button-query');
+  assert.equal(calls[1].payload.chat_id, 100);
+  assert.match(calls[1].payload.text, /"callback_query"/u);
+});
+
+test('истёкший callback не мешает доставке JSON', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  bot.api.config.use((previous, method, payload, signal) => method === 'answerCallbackQuery'
+    ? Promise.resolve({ ok: false, error_code: 400, description: 'Bad Request: query is too old' })
+    : previous(method, payload, signal));
+
+  await bot.handleUpdate({
+    update_id: 51,
+    callback_query: {
+      id: 'expired', from: { id: 100, is_bot: false, first_name: 'Тест' },
+      chat_instance: 'instance', inline_message_id: 'inline', data: 'example',
+    },
+  });
+
+  assert.deepEqual(calls.map(({ method }) => method), ['sendMessage']);
+  assert.equal(calls[0].payload.chat_id, 100);
+});
+
+test('сохраняет business connection у каждой части и пропускает свои business-ответы', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  const businessMessage = {
+    ...createMessageUpdate('private', 100).message,
+    business_connection_id: 'business-connection', text: 'x'.repeat(5000),
+  };
+
+  await bot.handleUpdate({ update_id: 52, business_message: businessMessage });
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every(({ payload }) => payload.business_connection_id === 'business-connection'));
+
+  await bot.handleUpdate({
+    update_id: 53,
+    business_message: { ...businessMessage, sender_business_bot: bot.botInfo },
+  });
+  assert.equal(calls.length, 2);
+
+  await bot.handleUpdate({
+    update_id: 54,
+    deleted_business_messages: {
+      business_connection_id: 'business-connection', chat: businessMessage.chat, message_ids: [42],
+    },
+  });
+  assert.equal(calls[2].payload.business_connection_id, 'business-connection');
+});
+
+test('не превращает business /start и редактирование /start в приветствие', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  const command = createMessageUpdate('private', 100, {
+    text: '/start', entities: [{ type: 'bot_command', offset: 0, length: 6 }],
+  }).message;
+
+  await bot.handleUpdate({ update_id: 55, business_message: { ...command, business_connection_id: 'bc' } });
+  await bot.handleUpdate({ update_id: 56, edited_message: command });
+
+  assert.deepEqual(calls.map(({ method }) => method), ['sendMessage', 'sendMessage']);
+  assert.ok(calls.every(({ payload }) => payload.text.startsWith('<pre>')));
+});
+
+test('сохраняет тему личного форума для /start и допускает уже удалённую команду', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  bot.api.config.use((previous, method, payload, signal) => method === 'deleteMessage'
+    ? Promise.resolve({ ok: false, error_code: 400, description: 'Bad Request: message to delete not found' })
+    : previous(method, payload, signal));
+
+  await bot.handleUpdate(createMessageUpdate('private', 100, {
+    text: '/start', message_thread_id: 77,
+    entities: [{ type: 'bot_command', offset: 0, length: 6 }],
+  }));
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.message_thread_id, 77);
+});
+
+test('отправляет большой Guest Update одним rich-сообщением', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+  const update = {
+    update_id: 57,
+    guest_message: {
+      ...createMessageUpdate('supergroup', -100).message,
+      guest_query_id: 'guest', text: '<tag>&😀'.repeat(1000),
+    },
+  };
+
+  await bot.handleUpdate(update);
+
+  assert.deepEqual(calls.map(({ method }) => method), ['answerGuestQuery']);
+  const content = calls[0].payload.result.input_message_content;
+  assert.deepEqual(content.rich_message.blocks, [{
+    type: 'pre', text: JSON.stringify(update, null, 2), language: 'json',
+  }]);
+  assert.equal(content.rich_message.skip_entity_detection, true);
+});
+
+test('сохраняет приватность каждой части ответа на ephemeral-команду', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+
+  await bot.handleUpdate(createMessageUpdate('supergroup', -100, {
+    message_id: 0,
+    ephemeral_message_id: 33,
+    receiver_user: bot.botInfo,
+    text: 'x'.repeat(5000),
+  }));
+
+  assert.equal(calls.length, 2);
+  for (const { payload } of calls) {
+    assert.deepEqual(payload.ephemeral_message_parameters, { receiver_user_id: 100 });
+    assert.deepEqual(payload.reply_parameters, { ephemeral_message_id: 33 });
+  }
+});
+
+test('ответ на ephemeral-кнопку виден только нажавшему её пользователю', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const calls = captureApiCalls(bot);
+  setTestBotInfo(bot);
+
+  await bot.handleUpdate({
+    update_id: 60,
+    callback_query: {
+      id: 'ephemeral-button',
+      from: { id: 100, is_bot: false, first_name: 'Тест' },
+      chat_instance: 'instance', data: 'example',
+      message: createMessageUpdate('supergroup', -100, {
+        message_id: 0, ephemeral_message_id: 77,
+        from: bot.botInfo, receiver_user: { id: 100, is_bot: false, first_name: 'Тест' },
+      }).message,
+    },
+  });
+
+  assert.deepEqual(calls.map(({ method }) => method), ['answerCallbackQuery', 'sendMessage']);
+  assert.deepEqual(calls[1].payload.ephemeral_message_parameters, {
+    receiver_user_id: 100, callback_query_id: 'ephemeral-button',
+  });
+  assert.equal(calls[1].payload.reply_parameters, undefined);
+});
+
+test('повторяет только отклонённую из-за 429 часть и продолжает отправку по порядку', async () => {
+  const bot = createBot({ token: '123456:test' });
+  setTestBotInfo(bot);
+  const [retry] = bot.api.config.installedTransformers();
+  const calls = [];
+  // Подставляем транспорт под реальный настроенный retry, а не поверх него.
+  bot.api.config.use((previous, ...args) => retry(async (method, payload) => {
+    calls.push(payload);
+    if (calls.length === 2) {
+      return { ok: false, error_code: 429, description: 'Too Many Requests', parameters: { retry_after: 0 } };
+    }
+    return { ok: true, result: { message_id: calls.length, chat: { id: 100, type: 'private' }, date: 1 } };
+  }, ...args));
+
+  const update = createMessageUpdate('private', 100, { text: 'x'.repeat(10000) });
+  await bot.handleUpdate(update);
+
+  assert.equal(calls.length, 4);
+  assert.equal(calls[1].text, calls[2].text);
+  const delivered = [calls[0], calls[2], calls[3]].map(({ text }) => text
+    .replace('<pre><code class="language-json">', '').replace('</code></pre>', ''));
+  assert.equal(delivered.join(''), JSON.stringify(update, null, 2));
+});
+
+test('ограничивает число повторов и не повторяет неопределённые сетевые сбои', async () => {
+  const bot = createBot({ token: '123456:test' });
+  const [retry] = bot.api.config.installedTransformers();
+  let attempts = 0;
+  const limited = { ok: false, error_code: 429, parameters: { retry_after: 0 } };
+  assert.strictEqual(await retry(async () => { attempts++; return limited; }, 'sendMessage', {}), limited);
+  assert.equal(attempts, 4);
+
+  attempts = 0;
+  const serverError = { ok: false, error_code: 500 };
+  assert.strictEqual(await retry(async () => { attempts++; return serverError; }, 'sendMessage', {}), serverError);
+  assert.equal(attempts, 1);
+
+  attempts = 0;
+  const networkError = new HttpError('Network failed', new Error('ECONNRESET'));
+  await assert.rejects(retry(async () => { attempts++; throw networkError; }, 'sendMessage', {}), networkError);
+  assert.equal(attempts, 1);
+
+  attempts = 0;
+  const longWait = { ok: false, error_code: 429, parameters: { retry_after: 61 } };
+  assert.strictEqual(await retry(async () => { attempts++; return longWait; }, 'sendMessage', {}), longWait);
+  assert.equal(attempts, 1);
 });

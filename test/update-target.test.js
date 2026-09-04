@@ -77,3 +77,134 @@ test('игнорирует сообщения, отправленные теку
     false,
   );
 });
+
+/** Проверяет, что бизнес-события адресуются через исходное подключение. */
+test('сохраняет business_connection_id сообщений и удалений', () => {
+  for (const updateType of ['business_message', 'edited_business_message', 'deleted_business_messages']) {
+    assert.deepEqual(getUpdateTarget({
+      [updateType]: { chat: { id: 456 }, business_connection_id: 'business-connection' },
+    }), {
+      chatId: 456,
+      messageThreadId: undefined,
+      businessConnectionId: 'business-connection',
+    });
+  }
+
+  assert.deepEqual(getUpdateTarget({
+    business_connection: { id: 'business-connection', user_chat_id: 123 },
+  }), { chatId: 123, messageThreadId: undefined });
+});
+
+/** Проверяет фактического отправителя ответа от имени бизнес-аккаунта. */
+test('распознаёт собственные бизнес-сообщения по sender_business_bot', () => {
+  for (const updateType of ['business_message', 'edited_business_message']) {
+    const message = {
+      from: { id: 456 },
+      sender_business_bot: { id: 123 },
+    };
+
+    assert.equal(isOwnMessageUpdate({ [updateType]: message }, 123), true);
+    assert.equal(isOwnMessageUpdate({ [updateType]: message }, 789), false);
+  }
+});
+
+/** Нажатие кнопки пользователем не является повтором собственного сообщения бота. */
+test('не игнорирует callback_query на собственном сообщении бота', () => {
+  const update = {
+    callback_query: {
+      from: { id: 456 },
+      message: { from: { id: 123 }, chat: { id: -100 }, message_thread_id: 77 },
+    },
+  };
+
+  assert.equal(isOwnMessageUpdate(update, 123), false);
+  assert.deepEqual(getUpdateTarget(update), { chatId: -100, messageThreadId: 77 });
+});
+
+/** Ответ на приватную команду виден её отправителю, а не всему групповому чату. */
+test('сохраняет приватность новых и отредактированных ephemeral-команд', () => {
+  for (const updateType of ['message', 'edited_message']) {
+    const update = {
+      [updateType]: {
+        message_id: 0,
+        ephemeral_message_id: 321,
+        chat: { id: -100, type: 'supergroup' },
+        message_thread_id: 77,
+        from: { id: 456, is_bot: false },
+        receiver_user: { id: 123, is_bot: true },
+      },
+    };
+
+    assert.deepEqual(getUpdateTarget(update), {
+      chatId: -100,
+      messageThreadId: 77,
+      ephemeralMessageParameters: { receiver_user_id: 456 },
+      replyParameters: { ephemeral_message_id: 321 },
+    });
+  }
+});
+
+/** У приватной кнопки получателем ответа становится пользователь, который её нажал. */
+test('сохраняет приватность callback_query на ephemeral-сообщении', () => {
+  const update = {
+    callback_query: {
+      id: 'private-callback',
+      from: { id: 456, is_bot: false },
+      message: {
+        message_id: 0,
+        ephemeral_message_id: 321,
+        chat: { id: -100, type: 'supergroup' },
+        from: { id: 123, is_bot: true },
+        receiver_user: { id: 456, is_bot: false },
+      },
+    },
+  };
+
+  assert.deepEqual(getUpdateTarget(update), {
+    chatId: -100,
+    messageThreadId: undefined,
+    ephemeralMessageParameters: { receiver_user_id: 456, callback_query_id: 'private-callback' },
+  });
+  assert.equal(isOwnMessageUpdate(update, 123), false);
+});
+
+/** Неполные приватные события не допускают публичного ответа или fallback в личный чат. */
+test('не раскрывает ephemeral-событие при недостаточных данных для ответа', () => {
+  const message = {
+    chat: { id: -100, type: 'supergroup' },
+    ephemeral_message_id: 321,
+    from: { id: 456, is_bot: false },
+  };
+  const invalidMessages = [
+    { ...message, from: undefined },
+    { ...message, from: { id: '456' } },
+    { ...message, from: { id: 0 } },
+    { ...message, from: { id: 123, is_bot: true } },
+    { ...message, ephemeral_message_id: undefined },
+    { ...message, ephemeral_message_id: '321' },
+    { ...message, chat: undefined },
+    { chat: message.chat, from: message.from, receiver_user: { id: 123 } },
+  ];
+
+  for (const invalidMessage of invalidMessages) {
+    assert.equal(getUpdateTarget({ message: invalidMessage }), undefined);
+  }
+
+  for (const callback of [
+    { id: 'query', from: message.from, message: { ...message, chat: undefined } },
+    { id: 'query', message },
+    { from: message.from, message },
+    { id: '', from: message.from, message },
+    { id: 'query', from: { id: 0 }, message },
+  ]) {
+    assert.equal(getUpdateTarget({ callback_query: callback }), undefined);
+  }
+});
+
+/** Нулевой message_id бывает у отложенной отправки и сам по себе не означает приватность. */
+test('не считает message_id 0 самостоятельным ephemeral-признаком', () => {
+  assert.deepEqual(getUpdateTarget({ message: { message_id: 0, chat: { id: -100 } } }), {
+    chatId: -100,
+    messageThreadId: undefined,
+  });
+});

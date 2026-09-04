@@ -1,8 +1,9 @@
 /** @file Запускает Telegram-бота в режиме long polling. */
 
 import { createBot } from './bot.js';
-import { config } from './config.js';
-import { POLLING_OPTIONS } from './polling.js';
+import { readConfig } from './config.js';
+import { formatError } from './errors.js';
+import { runPolling } from './polling.js';
 
 /**
  * Сообщает в консоли об успешном запуске бота.
@@ -20,21 +21,16 @@ function logBotStart({ username }) {
  * @returns {Promise<void>} Обещание, которое выполняется после остановки бота.
  */
 async function main() {
-  const bot = createBot(config);
-
-  /**
-   * Останавливает long polling при завершении процесса.
-   *
-   * @returns {void}
-   */
-  function stopBot() {
-    bot.stop();
+  let token = '';
+  try {
+    const config = readConfig();
+    token = config.token;
+    const bot = createBot(config);
+    await runPolling(bot, { onStart: logBotStart });
+  } catch (error) {
+    console.error(`Не удалось запустить или корректно остановить бота: ${formatError(error, token)}`);
+    process.exitCode = 1;
   }
-
-  process.once('SIGINT', stopBot);
-  process.once('SIGTERM', stopBot);
-
-  await bot.start({ ...POLLING_OPTIONS, onStart: logBotStart });
 }
 
 await main();

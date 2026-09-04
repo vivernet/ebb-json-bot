@@ -1,8 +1,11 @@
 /** @file Создаёт grammY-бота, который возвращает сырые Telegram Update как JSON. */
 
 import { Bot, GrammyError } from 'grammy';
+import { autoRetry } from '@grammyjs/auto-retry';
 
 import { serializeUpdate, splitText, wrapJsonAsPre } from './update-json.js';
+import { createGuestContent } from './guest.js';
+import { formatError } from './errors.js';
 import {
   getGuestQueryId,
   getUpdateTarget,
@@ -56,8 +59,8 @@ const EXPECTED_SEND_MESSAGE_ERRORS = Object.freeze([
   /not enough rights to send text messages/iu,
 ]);
 
-/** Ожидаемые ошибки ответа на Guest Mode-запрос с истёкшим сроком действия. */
-const EXPECTED_GUEST_QUERY_ERRORS = Object.freeze([
+/** Ожидаемые ошибки просроченного Guest Mode или callback-запроса. */
+const EXPECTED_QUERY_ERRORS = Object.freeze([
   /query is too old/iu,
   /query[_ ]id[_ ]invalid/iu,
 ]);
@@ -104,11 +107,22 @@ function createHtmlMessageOptions() {
 /**
  * Создаёт параметры отправки JSON в исходную тему форума.
  *
- * @param {{messageThreadId: number | undefined, directMessagesTopicId?: number}} target Адресат обновления.
+ * @param {import('./update-target.js').ChatTarget} target Адресат обновления.
  * @returns {object} Параметры `sendMessage`.
  */
 function createMessageOptions(target) {
   const htmlOptions = createHtmlMessageOptions();
+
+  if (target.businessConnectionId !== undefined) {
+    htmlOptions.business_connection_id = target.businessConnectionId;
+  }
+
+  if (target.ephemeralMessageParameters) {
+    htmlOptions.ephemeral_message_parameters = target.ephemeralMessageParameters;
+  }
+  if (target.replyParameters) {
+    htmlOptions.reply_parameters = target.replyParameters;
+  }
 
   if (target.directMessagesTopicId !== undefined) {
     return {
@@ -130,8 +144,16 @@ function createMessageOptions(target) {
  * @returns {Promise<void>} Обещание завершения отправки и удаления команды.
  */
 async function handleStart(context) {
-  await context.reply(createStartMessageHtml(context.me.username), createHtmlMessageOptions());
-  await context.deleteMessage();
+  await context.reply(createStartMessageHtml(context.me.username), createMessageOptions(
+    getUpdateTarget(context.update),
+  ));
+  try {
+    await context.deleteMessage();
+  } catch (error) {
+    if (!isExpectedDeliveryError(error)) {
+      throw error;
+    }
+  }
 }
 
 /**
@@ -142,29 +164,15 @@ async function handleStart(context) {
  * @param {import('grammy').Context} context Контекст входящего обновления.
  * @param {string} guestQueryId Идентификатор Guest Mode-запроса.
  * @param {string} json Сырое JSON-представление обновления.
- * @returns {Promise<boolean>} `true`, если JSON был полностью отправлен.
+ * @returns {Promise<void>} Завершение отправки ответа.
  */
 async function replyToGuestQuery(context, guestQueryId, json) {
-  const [jsonPart, ...remainingParts] = splitText(json);
-
-  if (remainingParts.length > 0) {
-    console.warn(
-      `Guest Mode update ${context.update.update_id} длиннее лимита Telegram и не может быть отправлен целиком.`,
-    );
-    return false;
-  }
-
   await context.api.answerGuestQuery(guestQueryId, {
     type: 'article',
     id: `raw-update-${context.update.update_id}`,
     title: 'Raw Telegram Update JSON',
-    input_message_content: {
-      message_text: wrapJsonAsPre(jsonPart),
-      ...createHtmlMessageOptions(),
-    },
+    input_message_content: createGuestContent(context.update, json),
   });
-
-  return true;
 }
 
 /**
@@ -180,11 +188,21 @@ async function handleRawUpdate(context) {
     return;
   }
 
-  const json = serializeUpdate(update);
+  // Подтверждение убирает индикатор на кнопке. Истёкший запрос не мешает показать JSON.
+  if (update.callback_query) {
+    try {
+      await context.answerCallbackQuery();
+    } catch (error) {
+      if (!isExpectedDeliveryError(error)) {
+        console.error(`Ошибка подтверждения кнопки: ${formatError(error, context.api.token)}`);
+      }
+    }
+  }
+
   const guestQueryId = getGuestQueryId(update);
 
   if (guestQueryId) {
-    await replyToGuestQuery(context, guestQueryId, json);
+    await replyToGuestQuery(context, guestQueryId, serializeUpdate(update));
     return;
   }
 
@@ -192,14 +210,14 @@ async function handleRawUpdate(context) {
 
   if (!target) {
     console.warn(
-      `Update ${update.update_id} типа ${getUpdateType(update)} не содержит чата для отправки JSON.`,
+      `Update ${update.update_id} типа ${getUpdateType(update)} не содержит достаточных данных для безопасной отправки JSON.`,
     );
     return;
   }
 
   const messageOptions = createMessageOptions(target);
 
-  for (const jsonPart of splitText(json)) {
+  for (const jsonPart of splitText(serializeUpdate(update))) {
     await context.api.sendMessage(target.chatId, wrapJsonAsPre(jsonPart), messageOptions);
   }
 }
@@ -226,9 +244,14 @@ export function isExpectedDeliveryError(error) {
       && EXPECTED_SEND_MESSAGE_ERRORS.some((pattern) => pattern.test(error.description));
   }
 
-  return error.method === 'answerGuestQuery'
+  if (error.method === 'deleteMessage') {
+    return error.error_code === 400
+      && /message to delete not found|message can't be deleted/iu.test(error.description);
+  }
+
+  return ['answerGuestQuery', 'answerCallbackQuery'].includes(error.method)
     && error.error_code === 400
-    && EXPECTED_GUEST_QUERY_ERRORS.some((pattern) => pattern.test(error.description));
+    && EXPECTED_QUERY_ERRORS.some((pattern) => pattern.test(error.description));
 }
 
 /**
@@ -236,21 +259,15 @@ export function isExpectedDeliveryError(error) {
  * завершения polling. Ошибки Telegram API выводятся кратко, без stack trace.
  *
  * @param {import('grammy').BotError<import('grammy').Context>} error Ошибка обработчика.
+ * @param {string} token Токен, исключаемый из диагностики.
  * @returns {void}
  */
-function handleBotError(error) {
+function handleBotError(error, token) {
   if (isExpectedDeliveryError(error.error)) {
     return;
   }
 
-  if (error.error instanceof GrammyError) {
-    console.error(
-      `Ошибка Telegram Bot API при обработке Update ${error.ctx.update.update_id}: ${error.error.method} — ${error.error.error_code}: ${error.error.description}`,
-    );
-    return;
-  }
-
-  console.error('Ошибка при обработке обновления Telegram:', error.error);
+  console.error(`Ошибка при обработке Update ${error.ctx.update.update_id}: ${formatError(error.error, token)}`);
 }
 
 /**
@@ -260,15 +277,27 @@ function handleBotError(error) {
  * @returns {Bot} Настроенный экземпляр бота.
  */
 export function createBot(settings) {
-  const botOptions = settings.apiRoot
-    ? { client: { apiRoot: settings.apiRoot } }
-    : undefined;
+  const botOptions = {
+    // Long polling ждёт 30 секунд; ещё 30 оставляем на соединение и ответ сервера.
+    client: { timeoutSeconds: 60, ...(settings.apiRoot ? { apiRoot: settings.apiRoot } : {}) },
+  };
   const bot = new Bot(settings.token, botOptions);
+  // Повторяем явный отказ с retry_after, сохраняя порядок частей JSON.
+  // Сетевые ошибки имеют неопределённый результат; повтор мог бы создать дубликат.
+  bot.api.config.use(autoRetry({
+    maxRetryAttempts: 3,
+    maxDelaySeconds: 60,
+    rethrowInternalServerErrors: true,
+    rethrowHttpErrors: true,
+  }));
   const privateMessages = bot.chatType('private');
 
-  privateMessages.command('start', handleStart);
+  // Командой запуска является только новое обычное сообщение пользователя.
+  privateMessages.on('message')
+    .filter((context) => !isOwnMessageUpdate(context.update, context.me.id))
+    .command('start', handleStart);
   bot.use(handleRawUpdate);
-  bot.catch(handleBotError);
+  bot.catch((error) => handleBotError(error, settings.token));
 
   return bot;
 }

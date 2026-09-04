@@ -25,14 +25,15 @@
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
-    "start": "node --env-file=.env src/index.js",
+    "start": "node --env-file-if-exists=.env src/index.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/bot.js && node --check src/polling.js && node --check src/update-json.js && node --check src/update-target.js && node --check src/update-types.js"
+    "check": "node scripts/check.js"
   },
   "engines": {
-    "node": ">=20.6.0"
+    "node": ">=22.9.0"
   },
   "dependencies": {
-    "grammy": "^1.45.1"
+    "@grammyjs/auto-retry": "^2.0.2",
+    "grammy": "^1.46.0"
   }
 }
